@@ -6,10 +6,24 @@ import subprocess
 import streamlit as st
 
 INTERMEDIATE_DIR = "/data/intermediate_data"
+PHASE5_DIR = f"{INTERMEDIATE_DIR}/phase5"
 MAFFT_DIR = f"{INTERMEDIATE_DIR}/mafft"
 MAFFT_SCRIPT = "/data/scripts/run_mafft.sh"
+PHASE5_SCRIPT = "/data/scripts/run_phase5_representatives.py"
+PHASE5_PREP_FLAG = f"{PHASE5_DIR}/representatives_prep_running.flag"
 R_SCRIPT = "/data/scripts/plot_tree.R"
 IQTREE_THREADS = os.environ.get("IQTREE_THREADS", "AUTO")
+
+REPRESENTATIVES_TSV = f"{PHASE5_DIR}/representatives.tsv"
+REPRESENTATIVES_FASTA = f"{PHASE5_DIR}/representatives.fasta"
+REPRESENTATIVES_MAFFT = f"{PHASE5_DIR}/representatives_mafft.fasta"
+REPRESENTATIVES_MAFFT_TRIM = f"{PHASE5_DIR}/representatives_mafft_trimmed.fasta"
+TOP10_IQ_PREFIX = REPRESENTATIVES_MAFFT_TRIM
+
+SCOPE_LABELS = {
+    "top10": "Top 10 species (all BLAST calls)",
+    "top10_single_species": "Top 10 (single-species QC)",
+}
 
 
 import re
@@ -42,8 +56,85 @@ def _tip_label_text(cluster: str, genus: str, species: str) -> str:
     return f"{cluster}\n{g}"
 
 
+def tip_meta_sidecar_path(treefile: str) -> str:
+    """Sidecar CSV path aligned with IQ-TREE prefix (strip .treefile suffix)."""
+    if treefile.endswith(".treefile"):
+        return treefile[: -len(".treefile")] + ".tip_meta.csv"
+    return f"{treefile}.tip_meta.csv"
+
+
+def is_top10_representative_tree(treefile: str) -> bool:
+    return os.path.basename(treefile) == "representatives_mafft_trimmed.fasta.treefile"
+
+
+def _display_tip_label(genus: str, species: str) -> str:
+    g = str(genus or "").strip().replace("_", " ")
+    s = str(species or "").strip().replace("_", " ")
+    if s and s.lower() not in ("nan", ""):
+        g_norm = g.lower()
+        s_norm = s.lower()
+        if g_norm and (s_norm.startswith(g_norm) or g_norm in s_norm):
+            return s
+        if g:
+            return f"{g} — {s}"
+        return s
+    return g if g else "Unknown"
+
+
+def _clean_genus_label(genus: str) -> str:
+    g = str(genus or "").strip()
+    if not g or g.lower() in ("nan", "na", "unknown", ""):
+        return "Unknown"
+    return g.replace("_", " ")
+
+
+def write_top10_tip_meta() -> str | None:
+    """Build tip_meta.csv for the top-10 representative tree from representatives.tsv."""
+    if not os.path.isfile(REPRESENTATIVES_TSV):
+        return None
+    try:
+        df = pd.read_csv(REPRESENTATIVES_TSV, sep="\t")
+    except (pd.errors.ParserError, OSError, ValueError):
+        return None
+    if df.empty or "Seq_ID" not in df.columns:
+        return None
+
+    rows = []
+    for _, row in df.iterrows():
+        genus = _clean_genus_label(row.get("Genus", ""))
+        species = str(row.get("Species", "") or "").strip()
+        if species.lower() in ("nan", ""):
+            species = ""
+        tip_label = str(row.get("Tip_Label", "") or "").strip()
+        if not tip_label or tip_label.lower() == "nan":
+            tip_label = _display_tip_label(genus, species)
+        rows.append(
+            {
+                "cluster": str(row["Seq_ID"]),
+                "genus": genus,
+                "species": species,
+                "tip_label": tip_label,
+                "source_cluster": str(row.get("Source_Cluster", "")),
+            }
+        )
+
+    if not rows:
+        return None
+
+    path = tip_meta_sidecar_path(f"{TOP10_IQ_PREFIX}.treefile")
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
 def build_tip_metadata_csv(treefile: str) -> str | None:
-    """Write tip metadata for R (cluster, genus, species, multiline tip_label)."""
+    """Resolve tip metadata CSV for R/ggtree (species labels, genus colors)."""
+    sidecar = tip_meta_sidecar_path(treefile)
+    if os.path.isfile(sidecar):
+        return sidecar
+
+    if is_top10_representative_tree(treefile):
+        return write_top10_tip_meta()
+
     ctx = tree_blast_context(treefile)
     if not ctx:
         return None
@@ -77,7 +168,7 @@ def build_tip_metadata_csv(treefile: str) -> str | None:
     if not rows:
         return None
 
-    csv_path = f"{treefile}.tip_meta.csv"
+    csv_path = tip_meta_sidecar_path(treefile)
     pd.DataFrame(rows).to_csv(csv_path, index=False)
     return csv_path
 
@@ -227,6 +318,242 @@ def launch_iqtree(cmd: list[str]) -> None:
         )
 
 
+def representatives_prep_running() -> bool:
+    return os.path.isfile(PHASE5_PREP_FLAG)
+
+
+def read_prep_log_tail(n: int = 20) -> str:
+    log_path = f"{PHASE5_DIR}/representatives_prep.log"
+    if not os.path.isfile(log_path):
+        return ""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return ""
+
+
+def launch_representatives_prep(scope: str) -> None:
+    os.makedirs(PHASE5_DIR, exist_ok=True)
+    with open(PHASE5_PREP_FLAG, "w", encoding="utf-8") as f:
+        f.write("running\n")
+    log_path = f"{PHASE5_DIR}/representatives_prep.log"
+    shell_cmd = (
+        f"python3 {PHASE5_SCRIPT} --scope {scope} >> {log_path} 2>&1; "
+        f"rm -f {PHASE5_PREP_FLAG}"
+    )
+    with open(log_path, "w", encoding="utf-8") as log:
+        log.write(f"$ {shell_cmd}\n\n")
+    subprocess.Popen(
+        ["bash", "-c", shell_cmd],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def load_representatives_table() -> pd.DataFrame:
+    if not os.path.isfile(REPRESENTATIVES_TSV):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(REPRESENTATIVES_TSV, sep="\t")
+    except (pd.errors.ParserError, OSError, ValueError):
+        return pd.DataFrame()
+
+
+def top10_alignment_path() -> str | None:
+    if os.path.isfile(REPRESENTATIVES_MAFFT_TRIM):
+        return REPRESENTATIVES_MAFFT_TRIM
+    if os.path.isfile(REPRESENTATIVES_MAFFT):
+        return REPRESENTATIVES_MAFFT
+    return None
+
+
+def render_iqtree_settings() -> tuple[str, int, int]:
+    with st.container(border=True):
+        st.markdown("**IQ-TREE settings**")
+        o1, o2, o3 = st.columns(3)
+        model = o1.selectbox(
+            "Substitution model",
+            ["MFP", "HKY+F+R5"],
+            help="MFP = ModelFinder (recommended for ITS).",
+            key="iqtree_model",
+        )
+        bootstrap = o2.selectbox(
+            "Ultrafast bootstrap (UFBoot)",
+            [1000, 500, 200, 0],
+            index=0,
+            help="Lower values run faster; 0 skips bootstrap.",
+            key="iqtree_bootstrap",
+        )
+        alrt = o3.selectbox(
+            "SH-aLRT replicates",
+            [1000, 500, 0],
+            index=0,
+            key="iqtree_alrt",
+        )
+    return model, int(bootstrap), int(alrt)
+
+
+def render_iqtree_run_status(iq_prefix: str, delete_key: str, refresh_key: str) -> bool:
+    """Show running / finished state. Returns True if caller should stop."""
+    treefile = f"{iq_prefix}.treefile"
+    logfile = f"{iq_prefix}.log"
+
+    if iqtree_running(iq_prefix):
+        st.warning("IQ-TREE is running…")
+        if st.button("Refresh", key=refresh_key):
+            st.rerun()
+        if os.path.isfile(logfile):
+            with open(logfile, encoding="utf-8", errors="replace") as f:
+                st.code("".join(f.readlines()[-20:]), language="log")
+        return True
+
+    if os.path.isfile(treefile):
+        st.success("This run already finished. Pick it in **Tree explorer** above or delete to re-run.")
+        if st.button("Delete this run", type="primary", key=delete_key):
+            for path in glob.glob(f"{iq_prefix}*"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            st.rerun()
+        return True
+
+    return False
+
+
+def run_iqtree_on_alignment(
+    align_input: str,
+    iq_prefix: str,
+    *,
+    model: str,
+    bootstrap: int,
+    alrt: int,
+    trimmed_copy_path: str | None = None,
+) -> None:
+    if trimmed_copy_path and align_input != trimmed_copy_path:
+        if align_input.endswith("_trimmed.fasta") or align_input.endswith("_mafft_trimmed.fasta"):
+            shutil.copy(align_input, trimmed_copy_path)
+            trimmed = trimmed_copy_path
+        else:
+            subprocess.run(
+                ["trimal", "-in", align_input, "-out", trimmed_copy_path, "-gappyout"],
+                check=True,
+            )
+            trimmed = trimmed_copy_path
+    else:
+        trimmed = align_input
+
+    cmd = build_iqtree_command(
+        trimmed,
+        iq_prefix,
+        model=model,
+        bootstrap=bootstrap,
+        alrt=alrt,
+    )
+    launch_iqtree(cmd)
+
+
+def render_top10_panel(model: str, bootstrap: int, alrt: int) -> None:
+    st.caption(
+        "One best ITS consensus per top species (highest identity + coverage), "
+        "MAFFT-aligned across all barcodes."
+    )
+
+    if representatives_prep_running():
+        st.warning("Preparing representatives and MAFFT alignment…")
+        if st.button("Refresh", key="iqtree_top10_prep_refresh"):
+            st.rerun()
+        st.code(read_prep_log_tail(25) or "(empty)", language="log")
+        return
+
+    scope_key = st.radio(
+        "Representative set",
+        list(SCOPE_LABELS.keys()),
+        format_func=lambda k: SCOPE_LABELS[k],
+        horizontal=True,
+        key="iqtree_top10_scope",
+    )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("Prepare representatives", key="iqtree_top10_prep"):
+            launch_representatives_prep(scope_key)
+            st.rerun()
+    with c2:
+        st.caption(
+            "Selects one cluster per species, builds `representatives.fasta`, runs MAFFT + trimAl."
+        )
+
+    reps_df = load_representatives_table()
+    align_path = top10_alignment_path()
+
+    if not reps_df.empty:
+        write_top10_tip_meta()
+        show_cols = [
+            c
+            for c in [
+                "Representative_Rank",
+                "Organism",
+                "Tip_Label",
+                "Seq_ID",
+                "Source_Cluster",
+                "Percent_Identity",
+                "Query_Coverage(%)",
+                "Confidence",
+            ]
+            if c in reps_df.columns
+        ]
+        st.markdown("**Selected representatives**")
+        st.dataframe(
+            reps_df[show_cols] if show_cols else reps_df,
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("No representatives yet. Click **Prepare representatives** first.")
+
+    m1, m2, m3 = st.columns(3)
+    n_reps = len(reps_df) if not reps_df.empty else 0
+    n_align = count_fasta_seqs(align_path) if align_path else 0
+    m1.metric("Representatives", n_reps)
+    m2.metric("Sequences in alignment", n_align)
+    m3.metric("Alignment ready", "Yes" if align_path and n_align >= 3 else "No")
+
+    iq_prefix = TOP10_IQ_PREFIX
+    st.caption(f"Tree outputs: `{os.path.basename(iq_prefix)}.*`")
+
+    if render_iqtree_run_status(
+        iq_prefix,
+        delete_key="iqtree_top10_delete",
+        refresh_key="iqtree_top10_refresh",
+    ):
+        return
+
+    if not align_path or n_align < 3:
+        st.warning("Need an alignment with ≥3 sequences. Run **Prepare representatives** first.")
+        return
+
+    if st.button("Run IQ-TREE on top 10", type="primary", key="iqtree_top10_run"):
+        write_top10_tip_meta()
+        with st.status("Starting IQ-TREE…", expanded=True) as status:
+            st.write(f"Alignment: `{os.path.basename(align_path)}` ({n_align} sequences)")
+            try:
+                run_iqtree_on_alignment(
+                    align_path,
+                    iq_prefix,
+                    model=model,
+                    bootstrap=bootstrap,
+                    alrt=alrt,
+                )
+                status.update(label="IQ-TREE started in background", state="complete")
+            except subprocess.CalledProcessError as exc:
+                st.error(f"Pipeline failed: {exc}")
+                return
+        st.rerun()
+
+
 def render_explorer() -> str | None:
     trees = find_tree_files()
     if not trees:
@@ -293,10 +620,20 @@ def render_generate_panel(*, has_trees: bool) -> None:
 
     analysis_mode = st.radio(
         "Scope",
-        ["Single sample (BLAST + MAFFT)", "Legacy global alignment"],
-        horizontal=True,
-        help="Per-sample trees use BLAST-filtered MAFFT alignments from the Consensuses module.",
+        [
+            "Top 10 representatives (cross-barcode)",
+            "Single sample (BLAST + MAFFT)",
+            "Legacy global alignment",
+        ],
+        horizontal=False,
+        help="Top 10: one best sequence per leading species across all barcodes.",
     )
+
+    model, bootstrap, alrt = render_iqtree_settings()
+
+    if analysis_mode.startswith("Top 10"):
+        render_top10_panel(model, bootstrap, alrt)
+        return
 
     selected_sample = ""
     blast_set = "strict"
@@ -328,22 +665,6 @@ def render_generate_panel(*, has_trees: bool) -> None:
         .replace(" ", "_")
     )
 
-    with st.container(border=True):
-        st.markdown("**IQ-TREE settings**")
-        o1, o2, o3 = st.columns(3)
-        model = o1.selectbox(
-            "Substitution model",
-            ["MFP", "HKY+F+R5"],
-            help="MFP = ModelFinder (recommended for ITS).",
-        )
-        bootstrap = o2.selectbox(
-            "Ultrafast bootstrap (UFBoot)",
-            [1000, 500, 200, 0],
-            index=0,
-            help="Lower values run faster; 0 skips bootstrap.",
-        )
-        alrt = o3.selectbox("SH-aLRT replicates", [1000, 500, 0], index=0)
-
     if analysis_mode.startswith("Single"):
         new_prefix = f"{INTERMEDIATE_DIR}/sample_{selected_sample}_{blast_set}_{run_suffix}"
         mafft_raw = f"{MAFFT_DIR}/{selected_sample}_{blast_set}_mafft.fasta"
@@ -355,30 +676,14 @@ def render_generate_panel(*, has_trees: bool) -> None:
 
     trimmed = f"{new_prefix}_trimmed.fasta"
     iq_prefix = f"{new_prefix}_trimmed.fasta"
-    treefile = f"{iq_prefix}.treefile"
-    logfile = f"{iq_prefix}.log"
 
     st.caption(f"Outputs: `{os.path.basename(iq_prefix)}.*`")
 
-    if iqtree_running(iq_prefix):
-        st.warning("IQ-TREE is running…")
-        if st.button("Refresh", key="iqtree_refresh_run"):
-            st.rerun()
-        if os.path.isfile(logfile):
-            with open(logfile, encoding="utf-8", errors="replace") as f:
-                st.code("".join(f.readlines()[-20:]), language="log")
-        return
-
-    if os.path.isfile(treefile):
-        st.success("This run already finished. Pick it in **Tree explorer** above or delete to re-run.")
-        if st.button("Delete this run", type="primary", key="iqtree_delete_run"):
-            for pattern in (f"{iq_prefix}*", f"{new_prefix}*"):
-                for path in glob.glob(pattern):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            st.rerun()
+    if render_iqtree_run_status(
+        iq_prefix,
+        delete_key="iqtree_delete_run",
+        refresh_key="iqtree_refresh_run",
+    ):
         return
 
     if st.button("Run trimAl + IQ-TREE", type="primary", key="iqtree_run_pipeline"):
@@ -404,33 +709,28 @@ def render_generate_panel(*, has_trees: bool) -> None:
             return
 
         with st.status("Building tree…", expanded=True) as status:
-            st.write("trimAl (-gappyout)")
-            if align_input.endswith("_trimmed.fasta") or align_input.endswith("_mafft_trimmed.fasta"):
-                shutil.copy(align_input, trimmed)
-            else:
-                subprocess.run(
-                    ["trimal", "-in", align_input, "-out", trimmed, "-gappyout"],
-                    check=True,
+            st.write("trimAl (-gappyout)" if align_input == mafft_raw else "Using trimmed alignment")
+            try:
+                run_iqtree_on_alignment(
+                    align_input,
+                    iq_prefix,
+                    model=model,
+                    bootstrap=bootstrap,
+                    alrt=alrt,
+                    trimmed_copy_path=trimmed,
                 )
+                status.update(label="IQ-TREE started in background", state="complete")
+            except subprocess.CalledProcessError as exc:
+                st.error(f"Pipeline failed: {exc}")
+                return
 
-            st.write("IQ-TREE")
-            cmd = build_iqtree_command(
-                trimmed,
-                iq_prefix,
-                model=model,
-                bootstrap=int(bootstrap),
-                alrt=int(alrt),
-            )
-            status.update(label="IQ-TREE started in background", state="complete")
-
-        launch_iqtree(cmd)
         st.rerun()
 
 
 def show_iqtree_page() -> None:
     page_hero(
         "Phylogenetic trees (IQ-TREE)",
-        "BLAST-aware alignments · optimized IQ-TREE · rectangular and circular ggtree views",
+        "Top-10 cross-barcode trees · per-sample alignments · ggtree views",
     )
 
     trees = find_tree_files()

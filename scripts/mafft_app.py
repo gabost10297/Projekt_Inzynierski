@@ -11,11 +11,16 @@ import plotly.express as px
 import streamlit as st
 
 MAFFT_DIR = "/data/intermediate_data/mafft"
+ORGANISM_MAFFT_DIR = os.path.join(MAFFT_DIR, "by_organism")
 BLAST_DIR = "/data/blast_results"
 CONSENSUS_DIR = "/data/consensus_results"
 MAFFT_SCRIPT = "/data/scripts/run_mafft.sh"
+ORGANISM_MAFFT_SCRIPT = "/data/scripts/run_phase4_mafft.py"
 MAFFT_LOG = f"{MAFFT_DIR}/mafft_run.log"
 MAFFT_RUNNING_FLAG = f"{MAFFT_DIR}/mafft_running.flag"
+ORGANISM_MAFFT_LOG = f"{ORGANISM_MAFFT_DIR}/phase4_run.log"
+ORGANISM_MAFFT_RUNNING_FLAG = f"{ORGANISM_MAFFT_DIR}/phase4_running.flag"
+ORGANISM_MANIFEST = f"{ORGANISM_MAFFT_DIR}/phase4_manifest.tsv"
 MANIFEST = f"{MAFFT_DIR}/manifest.tsv"
 
 PLOTLY_LAYOUT = dict(
@@ -34,6 +39,7 @@ LABEL_EXTRA_FIELDS = [
 
 LABEL_FIELD_LABELS = {
     "Cluster_Name": "Cluster",
+    "Barcode": "Barcode",
     "Genus": "Genus",
     "Species": "Species",
     "Confidence": "Confidence",
@@ -414,6 +420,13 @@ def resolve_cluster_meta(seq_id: str, meta_by_cluster: dict[str, dict]) -> dict 
             return row
         if sid.endswith(str(key)) or str(key).endswith(sid):
             return row
+    m = re.match(r"^(barcode\d+)_(.+)$", sid)
+    if m and sid in meta_by_cluster:
+        return meta_by_cluster[sid]
+    if m:
+        cluster = m.group(2)
+        if cluster in meta_by_cluster:
+            return meta_by_cluster[cluster]
     if sid.isdigit():
         alt = str(int(sid))
         if alt in meta_by_cluster:
@@ -431,6 +444,17 @@ def format_row_label(
     for field in fields:
         if field == "Cluster_Name":
             lines.append(html.escape(str(cluster_id)))
+            continue
+        if field == "Barcode":
+            barcode_val = ""
+            if meta and meta.get("Barcode") and not pd.isna(meta.get("Barcode")):
+                barcode_val = str(meta["Barcode"]).strip()
+            if not barcode_val:
+                m_bc = re.match(r"^(barcode\d+)_", str(cluster_id))
+                if m_bc:
+                    barcode_val = m_bc.group(1)
+            if barcode_val:
+                lines.append(html.escape(barcode_val))
             continue
         if not meta or field not in meta or pd.isna(meta[field]):
             continue
@@ -478,7 +502,13 @@ def render_view_tab(
         if os.path.exists(legacy):
             with st.expander("Legacy global alignment"):
                 sequences = load_alignment(legacy, os.path.getmtime(legacy))
-                visualize_mafft_alignment(sequences, list(sequences.keys())[:15], None, ['Cluster_Name'])
+                visualize_mafft_alignment(
+                    sequences,
+                    list(sequences.keys())[:15],
+                    None,
+                    ["Cluster_Name"],
+                    key_prefix="mafft_legacy",
+                )
         return
 
     if not selected:
@@ -525,7 +555,13 @@ def render_view_tab(
     )
     label_fields = ["Cluster_Name"] + [f for f in extra_labels if f in LABEL_EXTRA_FIELDS]
 
-    visualize_mafft_alignment(sequences, in_aln, meta_lookup, label_fields)
+    visualize_mafft_alignment(
+        sequences,
+        in_aln,
+        meta_lookup,
+        label_fields,
+        key_prefix=f"mafft_view_{sample}_{mode}",
+    )
 
 
 def visualize_mafft_alignment(
@@ -533,6 +569,8 @@ def visualize_mafft_alignment(
     selected_seqs: list[str],
     meta_by_cluster: dict[str, dict] | None = None,
     label_fields: list[str] | None = None,
+    *,
+    key_prefix: str = "mafft_view",
 ) -> None:
     colors = {
         "A": "#9F1B12",
@@ -561,13 +599,13 @@ def visualize_mafft_alignment(
             1,
             aln_length,
             (1, default_window),
-            key="mafft_view_window",
+            key=f"{key_prefix}_window",
         )
     with ctrl2:
         highlight_mutations = st.checkbox(
             "Highlight mutations only",
             value=True,
-            key="mafft_highlight_mut",
+            key=f"{key_prefix}_highlight_mut",
         )
         st.caption(f"Alignment length: **{aln_length}** bp")
 
@@ -796,6 +834,348 @@ def render_compare_tab(all_samples: list[str]) -> None:
         st.plotly_chart(fig2, width="stretch")
 
 
+@st.cache_data(show_spinner=False)
+def load_organism_manifest(mtime: float) -> pd.DataFrame:
+    del mtime
+    if not os.path.isfile(ORGANISM_MANIFEST):
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(ORGANISM_MANIFEST, sep="\t")
+    except (pd.errors.ParserError, OSError, ValueError):
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def load_organism_clusters(tsv_path: str, mtime: float) -> pd.DataFrame:
+    del mtime
+    if not os.path.isfile(tsv_path):
+        return pd.DataFrame()
+    return pd.read_csv(tsv_path, sep="\t")
+
+
+def organism_metadata_lookup(clusters_df: pd.DataFrame) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+    if clusters_df.empty:
+        return lookup
+    for _, row in clusters_df.iterrows():
+        barcode = str(row.get("Barcode", "")).strip()
+        cluster = str(row.get("Cluster_Name", "")).strip()
+        meta = row.to_dict()
+        if barcode and cluster:
+            lookup[f"{barcode}_{cluster}"] = meta
+        if cluster:
+            lookup[cluster] = meta
+            if cluster.isdigit():
+                lookup[str(int(cluster))] = meta
+    return lookup
+
+
+def organism_alignment_paths(slug_row: pd.Series) -> dict[str, str]:
+    return {
+        "raw": str(slug_row.get("Raw_alignment", "") or ""),
+        "trimmed": str(slug_row.get("Trimmed_alignment", "") or ""),
+        "clusters": str(slug_row.get("Cluster_list", "") or ""),
+    }
+
+
+def organism_mafft_is_running() -> bool:
+    return os.path.isfile(ORGANISM_MAFFT_RUNNING_FLAG)
+
+
+def read_organism_mafft_log_tail(n: int = 25) -> str:
+    if not os.path.isfile(ORGANISM_MAFFT_LOG):
+        return ""
+    try:
+        with open(ORGANISM_MAFFT_LOG, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return ""
+
+
+def launch_organism_mafft() -> None:
+    os.makedirs(ORGANISM_MAFFT_DIR, exist_ok=True)
+    with open(ORGANISM_MAFFT_RUNNING_FLAG, "w", encoding="utf-8") as f:
+        f.write("running\n")
+    shell_cmd = (
+        f"python3 {ORGANISM_MAFFT_SCRIPT} >> {ORGANISM_MAFFT_LOG} 2>&1; "
+        f"rm -f {ORGANISM_MAFFT_RUNNING_FLAG}"
+    )
+    with open(ORGANISM_MAFFT_LOG, "w", encoding="utf-8") as log:
+        log.write(f"$ {shell_cmd}\n\n")
+    subprocess.Popen(
+        ["bash", "-c", shell_cmd],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    load_organism_manifest.clear()
+    load_organism_clusters.clear()
+    load_alignment.clear()
+
+
+def render_organism_view_tab(
+    fasta_path: str,
+    clusters_path: str,
+    organism_label: str,
+    selected: list[str],
+) -> None:
+    if not fasta_path or not os.path.isfile(fasta_path):
+        st.info(
+            "No alignment file for this organism. Build alignments on the **By organism** tab."
+        )
+        return
+
+    if not selected:
+        st.warning("No sequences selected. Adjust barcode filters or sequence list.")
+        return
+
+    mtime = os.path.getmtime(fasta_path)
+    sequences = load_alignment(fasta_path, mtime)
+    in_aln = [s for s in selected if s in sequences]
+    missing = [s for s in selected if s not in sequences]
+
+    if missing:
+        st.caption(f"{len(missing)} selected IDs not found in the alignment file.")
+
+    st.caption(
+        f"`{os.path.basename(fasta_path)}` · **{organism_label}** · "
+        f"showing {len(in_aln)} / {len(sequences)} sequences"
+    )
+
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "Download full alignment",
+            alignment_fasta_bytes(fasta_path),
+            file_name=os.path.basename(fasta_path),
+            mime="text/plain",
+            width="stretch",
+            key=f"org_dl_full_{organism_label}",
+        )
+    with dl2:
+        if in_aln:
+            safe_name = re.sub(r"[^\w]+", "_", organism_label)[:60]
+            st.download_button(
+                "Download selected subset (FASTA)",
+                subset_fasta_bytes(sequences, in_aln),
+                file_name=f"{safe_name}_subset.fasta",
+                mime="text/plain",
+                width="stretch",
+                key=f"org_dl_sub_{organism_label}",
+            )
+
+    clusters_df = (
+        load_organism_clusters(clusters_path, os.path.getmtime(clusters_path))
+        if clusters_path and os.path.isfile(clusters_path)
+        else pd.DataFrame()
+    )
+    meta_lookup = organism_metadata_lookup(clusters_df)
+
+    extra_labels = st.multiselect(
+        "Also show in row labels",
+        options=LABEL_EXTRA_FIELDS + ["Barcode"],
+        default=["Barcode", "Genus", "Species"],
+        format_func=lambda f: "Barcode" if f == "Barcode" else LABEL_FIELD_LABELS.get(f, f),
+        key=f"org_view_labels_{organism_label}",
+    )
+    label_fields = ["Cluster_Name"] + [f for f in extra_labels if f != "Cluster_Name"]
+    org_key = re.sub(r"[^\w]+", "_", organism_label)[:80]
+    visualize_mafft_alignment(
+        sequences,
+        in_aln,
+        meta_lookup,
+        label_fields,
+        key_prefix=f"mafft_org_{org_key}",
+    )
+
+
+def render_by_organism_tab() -> None:
+    st.caption(
+        "Cross-barcode MAFFT alignments per top species (`intermediate_data/mafft/by_organism/`). "
+        "One alignment per taxon — sequence IDs are `barcodeXX_cluster`."
+    )
+
+    if organism_mafft_is_running():
+        st.warning("Organism alignments are running in the background.")
+        if st.button("Refresh", key="organism_mafft_refresh_running"):
+            st.rerun()
+        st.code(read_organism_mafft_log_tail(30) or "(empty)", language="log")
+        return
+
+    manifest_mtime = (
+        os.path.getmtime(ORGANISM_MANIFEST) if os.path.isfile(ORGANISM_MANIFEST) else 0.0
+    )
+    manifest = load_organism_manifest(manifest_mtime)
+    ok_rows = (
+        manifest[manifest["Status"].astype(str) == "ok"] if not manifest.empty else pd.DataFrame()
+    )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("Build top-10 alignments", type="primary", key="organism_mafft_run_btn"):
+            launch_organism_mafft()
+            st.rerun()
+    with c2:
+        st.caption(
+            "MAFFT on all clusters assigned to each of the top 10 species (full BLAST set)."
+        )
+
+    if manifest.empty or ok_rows.empty:
+        st.info(
+            "No organism alignments yet. Click **Build top-10 alignments** to generate them."
+        )
+        with st.expander("Run log", expanded=False):
+            st.code(read_organism_mafft_log_tail(40) or "No log yet.", language="log")
+        return
+
+    organism_options = ok_rows["Organism"].astype(str).tolist()
+    default_org = organism_options[0]
+    rank_map = dict(zip(ok_rows["Organism"].astype(str), ok_rows["Rank"]))
+
+    picked_org = st.selectbox(
+        "Organism",
+        organism_options,
+        format_func=lambda o: f"#{int(rank_map.get(o, 0))} {o}",
+        key="mafft_organism_pick",
+    )
+    row = ok_rows[ok_rows["Organism"].astype(str) == picked_org].iloc[0]
+    paths = organism_alignment_paths(row)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Sequences", int(row.get("Sequences_aligned", 0)))
+    m2.metric("Expected clusters", int(row.get("Clusters_expected", 0)))
+    m3.metric("Missing FASTA", int(row.get("Sequences_missing", 0)))
+    m4.metric("Status", str(row.get("Status", "—")))
+
+    clusters_path = paths["clusters"]
+    clusters_df = (
+        load_organism_clusters(clusters_path, os.path.getmtime(clusters_path))
+        if clusters_path and os.path.isfile(clusters_path)
+        else pd.DataFrame()
+    )
+
+    sub_run, sub_clusters, sub_view = st.tabs(["Summary", "Cluster list", "View alignment"])
+
+    with sub_run:
+        st.markdown("**Selected organism**")
+        st.dataframe(
+            pd.DataFrame([row]).drop(columns=["Raw_alignment", "Trimmed_alignment"], errors="ignore"),
+            hide_index=True,
+            width="stretch",
+        )
+        if not manifest.empty:
+            st.markdown("**All organism alignments**")
+            show_manifest = manifest.copy()
+            for col in ("Raw_alignment", "Trimmed_alignment", "Cluster_list"):
+                if col in show_manifest.columns:
+                    show_manifest[col] = show_manifest[col].apply(
+                        lambda p: os.path.basename(str(p)) if pd.notna(p) and str(p) else ""
+                    )
+            st.dataframe(show_manifest, hide_index=True, width="stretch")
+        with st.expander("Run log", expanded=False):
+            st.code(read_organism_mafft_log_tail(60) or "No log yet.", language="log")
+
+    with sub_clusters:
+        if clusters_df.empty:
+            st.warning("Cluster list TSV not found for this organism.")
+        else:
+            st.caption(f"`{os.path.basename(clusters_path)}` · {len(clusters_df)} clusters")
+            show_cols = [
+                c
+                for c in [
+                    "Barcode",
+                    "Cluster_Name",
+                    "Genus",
+                    "Species",
+                    "Percent_Identity",
+                    "Query_Coverage(%)",
+                    "Confidence",
+                    "Single_Organism",
+                ]
+                if c in clusters_df.columns
+            ]
+            st.dataframe(
+                clusters_df[show_cols] if show_cols else clusters_df,
+                hide_index=True,
+                width="stretch",
+            )
+            if "Barcode" in clusters_df.columns:
+                bc_counts = clusters_df["Barcode"].value_counts().reset_index()
+                bc_counts.columns = ["Barcode", "Clusters"]
+                fig = px.bar(
+                    bc_counts,
+                    x="Barcode",
+                    y="Clusters",
+                    title=f"Clusters per barcode · {picked_org}",
+                )
+                fig.update_layout(**PLOTLY_LAYOUT, height=320)
+                st.plotly_chart(fig, width="stretch", key=f"org_bc_chart_{picked_org}")
+
+    with sub_view:
+        align_type = st.radio(
+            "Alignment file",
+            ["Trimmed (trimAl)", "Raw (MAFFT)"],
+            horizontal=True,
+            key="mafft_organism_view_type",
+        )
+        fasta_path = paths["trimmed"] if align_type.startswith("Trimmed") else paths["raw"]
+        if not fasta_path or not os.path.isfile(fasta_path):
+            fasta_path = paths["raw"]
+
+        all_seq_ids: list[str] = []
+        if fasta_path and os.path.isfile(fasta_path):
+            all_seq_ids = list(load_alignment(fasta_path, os.path.getmtime(fasta_path)).keys())
+
+        barcodes = sorted(
+            {
+                str(b)
+                for b in clusters_df.get("Barcode", pd.Series(dtype=str)).dropna().astype(str)
+            }
+        )
+        if not barcodes and all_seq_ids:
+            barcodes = sorted(
+                {m.group(1) for s in all_seq_ids if (m := re.match(r"^(barcode\d+)_", s))}
+            )
+
+        f1, f2 = st.columns(2)
+        with f1:
+            barcode_filter = st.multiselect(
+                "Barcodes to show",
+                barcodes,
+                default=barcodes,
+                key=f"org_view_barcodes_{picked_org}",
+            )
+        with f2:
+            max_show = st.number_input(
+                "Max sequences in viewer",
+                min_value=5,
+                max_value=max(5, len(all_seq_ids)),
+                value=min(40, len(all_seq_ids)) if all_seq_ids else 40,
+                key=f"org_view_max_{picked_org}",
+            )
+
+        filtered_ids = []
+        for seq_id in all_seq_ids:
+            m = re.match(r"^(barcode\d+)_(.+)$", seq_id)
+            if m and barcode_filter and m.group(1) not in barcode_filter:
+                continue
+            filtered_ids.append(seq_id)
+
+        if len(filtered_ids) > max_show:
+            st.caption(
+                f"Showing first **{max_show}** of **{len(filtered_ids)}** sequences "
+                "(large cross-barcode sets — narrow barcodes or download full FASTA)."
+            )
+            filtered_ids = filtered_ids[: int(max_show)]
+
+        render_organism_view_tab(
+            fasta_path,
+            clusters_path,
+            picked_org,
+            filtered_ids,
+        )
+
+
 def show_mafft_page() -> None:
     page_hero(
         "Multiple Sequence Alignment (MAFFT)",
@@ -836,8 +1216,8 @@ def show_mafft_page() -> None:
     )
 
     paths = alignment_paths(sample, blast_mode)
-    tab_run, tab_sets, tab_view, tab_compare = st.tabs(
-        ["Run", "Sequence sets", "View", "Compare barcodes"]
+    tab_run, tab_sets, tab_view, tab_compare, tab_organism = st.tabs(
+        ["Run", "Sequence sets", "View", "Compare barcodes", "By organism"]
     )
 
     with tab_run:
@@ -863,3 +1243,6 @@ def show_mafft_page() -> None:
 
     with tab_compare:
         render_compare_tab(samples)
+
+    with tab_organism:
+        render_by_organism_tab()

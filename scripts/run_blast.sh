@@ -1,12 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# --- Config ---
+# Config
 BLAST_DB="/data/database/unite_blast_db"
 THREADS="${BLAST_THREADS:-10}"
 MAX_TARGET_SEQS=5
 PERC_IDENTITY=90
 EVALUE_CUTOFF=1e-20
+# Confidence rating thresholds (percent identity / query coverage)
+HIGH_PIDENT=99
+HIGH_QCOV=92
+LOW_PIDENT=97
+LOW_QCOV=85
 
 mkdir -p /data/blast_results
 
@@ -61,7 +66,9 @@ for sample_dir in /data/consensus_results/*; do
             continue
         fi
 
-        awk -v cluster="$CLUSTER" -v qlen="$QUERY_LEN" -v tier="$LENGTH_TIER" '
+        awk -v cluster="$CLUSTER" -v qlen="$QUERY_LEN" -v tier="$LENGTH_TIER" \
+            -v high_pid="$HIGH_PIDENT" -v high_qcov="$HIGH_QCOV" \
+            -v low_pid="$LOW_PIDENT" -v low_qcov="$LOW_QCOV" '
         BEGIN { FS = OFS = "\t" }
         NR == 1 {
             ref = $2
@@ -84,13 +91,19 @@ for sample_dir in /data/consensus_results/*; do
             if (tier == "LONG") {
                 conf = "review_long"
                 level = "manual_review"
-            } else if (tier == "A" && p1 >= 97 && qcov >= 85 && aln >= 400 && eval <= 1e-20 && gap >= 0.5) {
+            } else if (tier == "A" && p1 >= high_pid && qcov >= high_qcov && aln >= 400 && eval <= 1e-20 && gap >= 0.5) {
                 conf = "high"
                 level = "species"
-            } else if (tier == "B" && p1 >= 98 && qcov >= 90 && aln >= 350 && gap >= 0.5) {
+            } else if (tier == "A" && p1 >= low_pid && qcov >= low_qcov && aln >= 400 && eval <= 1e-20 && gap >= 0.5) {
                 conf = "medium"
                 level = "species"
-            } else if (tier == "C" && p1 >= 99 && qcov >= 92 && gap >= 1.0) {
+            } else if (tier == "B" && p1 >= high_pid && qcov >= high_qcov && aln >= 350 && gap >= 0.5) {
+                conf = "high"
+                level = "species"
+            } else if (tier == "B" && p1 >= low_pid && qcov >= low_qcov && aln >= 350 && gap >= 0.5) {
+                conf = "medium"
+                level = "species"
+            } else if (tier == "C" && p1 >= low_pid && qcov >= low_qcov && gap >= 1.0) {
                 conf = "low_species"
                 level = "species"
             } else if (p1 >= 90 && qcov >= 75 && aln >= 200) {

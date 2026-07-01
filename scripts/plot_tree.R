@@ -90,7 +90,13 @@ load_tip_meta <- function(tree) {
     }
   }
 
-  tip_df$genus <- ifelse(is.na(tip_df$genus) | tip_df$genus == "", "Unknown", tip_df$genus)
+  tip_df$genus <- ifelse(
+    is.na(tip_df$genus) | tip_df$genus == "" |
+      tolower(trimws(tip_df$genus)) %in% c("na", "nan", "unknown"),
+    "Unknown",
+    trimws(tip_df$genus)
+  )
+  tip_df$genus <- gsub("_", " ", tip_df$genus)
   tip_df
 }
 
